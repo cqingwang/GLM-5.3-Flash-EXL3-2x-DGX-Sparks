@@ -77,6 +77,21 @@ unset _k _kv _flags _caller_overrides
 
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"
+# When set, serve this already materialized local checkpoint instead of the
+# HuggingFace cache derived from MODEL. The top-level deployer supplies this
+# as /opt/models/<org>/<model>; MODEL remains the logical Hub id for logs and
+# optional draft/download settings.
+MODEL_PATH_OVERRIDE="${MODEL_PATH:-}"
+MODEL_PATH_OVERRIDE="${MODEL_PATH_OVERRIDE%/}"
+MODEL_ROOT="${MODEL_ROOT:-}"
+CONTAINER_MODEL_ROOT="${CONTAINER_MODEL_ROOT:-/models}"
+if [ -n "$MODEL_PATH_OVERRIDE" ]; then
+    case "$MODEL_PATH_OVERRIDE" in
+        /*) ;;
+        *) echo "ERROR: MODEL_PATH must be an absolute local checkpoint path: $MODEL_PATH_OVERRIDE" >&2; exit 1 ;;
+    esac
+    MODEL_ROOT="${MODEL_ROOT:-${MODEL_PATH_OVERRIDE%/*/*}}"
+fi
 # If the durable mirror is empty/moved, download.sh falls back to this id.
 MODEL_FALLBACK="${MODEL_FALLBACK:-brandonmusic/GLM-5.3-Flash-tr3-4bpw}"
 MODEL_CACHE_NAME="${MODEL_CACHE_NAME:-models--${MODEL//\//--}}"
@@ -281,10 +296,39 @@ CONTAINER_HEAD="${CONTAINER_HEAD:-glm53-exl3-head}"
 CONTAINER_WORKER="${CONTAINER_WORKER:-glm53-exl3-worker}"
 
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
-MODEL_PATH="$HF_CACHE_DIR/hub/$MODEL_CACHE_NAME"
+if [ -n "$MODEL_PATH_OVERRIDE" ]; then
+    MODEL_PATH="${MODEL_PATH_OVERRIDE%/}"
+    MODEL_PATH_MODE="direct"
+else
+    MODEL_PATH="$HF_CACHE_DIR/hub/$MODEL_CACHE_NAME"
+    MODEL_PATH_MODE="hf-cache"
+fi
 FALLBACK_MODEL_PATH="$HF_CACHE_DIR/hub/$MODEL_FALLBACK_CACHE_NAME"
 DFLASH_PATH="$HF_CACHE_DIR/hub/$DFLASH_CACHE_NAME"
+DFLASH_MODEL_PATH_OVERRIDE="${DFLASH_MODEL_PATH:-}"
+DFLASH_PATH_MODE="hf-cache"
+if [ "$MODEL_PATH_MODE" = "direct" ]; then
+    if [ -n "$DFLASH_MODEL_PATH_OVERRIDE" ]; then
+        DFLASH_MODEL_PATH="$DFLASH_MODEL_PATH_OVERRIDE"
+        [ -d "$DFLASH_MODEL_PATH" ] || { echo "ERROR: DFLASH_MODEL_PATH does not exist: $DFLASH_MODEL_PATH" >&2; exit 1; }
+        DFLASH_PATH="$DFLASH_MODEL_PATH"
+        DFLASH_PATH_MODE="direct"
+    elif [ -d "$MODEL_ROOT/$DFLASH_MODEL" ]; then
+        DFLASH_MODEL_PATH="$MODEL_ROOT/$DFLASH_MODEL"
+        DFLASH_PATH="$DFLASH_MODEL_PATH"
+        DFLASH_PATH_MODE="direct"
+    fi
+fi
 WORKER_CACHE_DIR="$WORKER_HOME/.cache/huggingface"
+WORKER_MODEL_PATH="${WORKER_MODEL_PATH:-$MODEL_PATH}"
+WORKER_MODEL_ROOT="${WORKER_MODEL_ROOT:-${WORKER_MODEL_PATH%/*/*}}"
+WORKER_DFLASH_MODEL_PATH="${WORKER_DFLASH_MODEL_PATH:-}"
+if [ "$DFLASH_PATH_MODE" = "direct" ] && [ -z "$WORKER_DFLASH_MODEL_PATH" ]; then
+    case "$DFLASH_PATH" in
+        "$MODEL_ROOT"/*) WORKER_DFLASH_MODEL_PATH="$WORKER_MODEL_ROOT/${DFLASH_PATH#"$MODEL_ROOT"/}" ;;
+        *) echo "ERROR: set WORKER_DFLASH_MODEL_PATH when DFLASH_MODEL_PATH is outside MODEL_ROOT" >&2; exit 1 ;;
+    esac
+fi
 CACHE_ROOT="${CACHE_ROOT:-$HOME/.cache/vllm-glm53-flash}"
 WORKER_VLLM_CACHE="${WORKER_VLLM_CACHE:-$WORKER_HOME/.cache/vllm-glm53-flash}"
 # Overlay FS ~/.triton and ~/.tilelang die on container recreate (TP=2 JIT
@@ -394,6 +438,11 @@ usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 count_shards() {
     local repo_path="$1" ref
+    if [ -f "$repo_path/config.json" ]; then
+        find -L "$repo_path" -maxdepth 1 -type f -name '*.safetensors' 2>/dev/null \
+            | wc -l | tr -d '[:space:]' || true
+        return
+    fi
     ref="$(cat "$repo_path/refs/main" 2>/dev/null || true)"
     [ -n "$ref" ] || ref="$(ls -1t "$repo_path/snapshots" 2>/dev/null | head -n 1 || true)"
     if [ -z "$ref" ]; then
@@ -405,6 +454,7 @@ count_shards() {
 }
 
 ensure_refs_main() {
+    [ "$MODEL_PATH_MODE" = "direct" ] && return 0
     local ref="$MODEL_PATH/refs/main" snap
     [ -f "$ref" ] && [ -n "$(<"$ref")" ] && return 0
     snap="$(ls -1t "$MODEL_PATH/snapshots" 2>/dev/null | head -n 1 || true)"
@@ -415,6 +465,16 @@ ensure_refs_main() {
 }
 
 resolve_model_dir() {
+    if [ "$MODEL_PATH_MODE" = "direct" ]; then
+        [ -f "$MODEL_PATH/config.json" ] || die "config.json missing in local MODEL_PATH: $MODEL_PATH"
+        case "$MODEL_PATH" in
+            "$MODEL_ROOT"/*)
+                printf '%s/%s' "$CONTAINER_MODEL_ROOT" "${MODEL_PATH#"$MODEL_ROOT"/}"
+                return
+                ;;
+            *) die "MODEL_PATH must be below MODEL_ROOT for container mounting: MODEL_PATH=$MODEL_PATH MODEL_ROOT=$MODEL_ROOT" ;;
+        esac
+    fi
     local ref="$MODEL_PATH/refs/main" hash dir
     ensure_refs_main
     hash="$(<"$ref")"
@@ -434,6 +494,17 @@ ensure_dflash_refs_main() {
 }
 
 resolve_dflash_dir() {
+    if [ "$DFLASH_PATH_MODE" = "direct" ]; then
+        [ -f "$DFLASH_PATH/config.json" ] || die "DFlash2 config.json missing in local path: $DFLASH_PATH"
+        [ -f "$DFLASH_PATH/model.safetensors" ] || die "DFlash2 model.safetensors missing in local path: $DFLASH_PATH"
+        case "$DFLASH_PATH" in
+            "$MODEL_ROOT"/*)
+                printf '%s/%s' "$CONTAINER_MODEL_ROOT" "${DFLASH_PATH#"$MODEL_ROOT"/}"
+                return
+                ;;
+            *) die "DFLASH_PATH must be below MODEL_ROOT for container mounting: DFLASH_PATH=$DFLASH_PATH MODEL_ROOT=$MODEL_ROOT" ;;
+        esac
+    fi
     local ref="$DFLASH_PATH/refs/main" hash dir
     if [ -n "${DFLASH_REVISION:-}" ]; then
         hash="$DFLASH_REVISION"
@@ -785,6 +856,15 @@ ensure_image() {
 # Use an already-complete local tree (primary or upstream fallback). If the
 # durable Mia-AiLab mirror is still filling / 404s, keep serving from the
 # brandonmusic cache folder without a second 164 GiB pull.
+verify_local_model() {
+    local have
+    [ -d "$MODEL_PATH" ] || die "local MODEL_PATH does not exist: $MODEL_PATH"
+    [ -f "$MODEL_PATH/config.json" ] || die "local MODEL_PATH has no config.json: $MODEL_PATH"
+    have="$(count_shards "$MODEL_PATH")"
+    [ "${have:-0}" -gt 0 ] || die "local MODEL_PATH has no safetensors: $MODEL_PATH"
+    log "using local model path: $MODEL_PATH (${have} safetensors)"
+}
+
 adopt_complete_weights() {
     local have
     have="$(count_shards "$MODEL_PATH")"
@@ -838,6 +918,10 @@ hf_download_repo() {
 }
 
 download_weights() {
+    if [ "$MODEL_PATH_MODE" = "direct" ]; then
+        verify_local_model
+        return
+    fi
     [ "${SKIP_DOWNLOAD:-0}" = "1" ] && { log "SKIP_DOWNLOAD=1 — skipping download check"; return; }
     if [ "${REFRESH_WEIGHTS:-0}" != "1" ] && adopt_complete_weights; then
         return
@@ -870,6 +954,11 @@ download_weights() {
 
 download_dflash() {
     [ "$SPEC_METHOD" = "dflash" ] || return 0
+    if [ "$DFLASH_PATH_MODE" = "direct" ]; then
+        resolve_dflash_dir >/dev/null
+        log "using local DFlash2 path: $DFLASH_PATH"
+        return
+    fi
     [ "${SKIP_DOWNLOAD:-0}" = "1" ] && { log "SKIP_DOWNLOAD=1 — skipping DFlash2 download check"; return; }
     local have=0 selected=""
     if [ -n "${DFLASH_REVISION:-}" ]; then
@@ -895,6 +984,12 @@ download_dflash() {
 
 # Head-only Hub fetch. No docker, no SSH, no worker rsync.
 download_only() {
+    if [ "$MODEL_PATH_MODE" = "direct" ]; then
+        verify_local_model
+        download_dflash
+        log "local MODEL_PATH selected; no target download performed"
+        return
+    fi
     local have
     resolve_hf_bin || die "no 'hf' / 'huggingface-cli' on PATH and no python huggingface_hub — pip install --user -U 'huggingface_hub[cli]' (or set HF_BIN=/path/to/hf)"
     mkdir -p "$HF_CACHE_DIR"
@@ -961,6 +1056,35 @@ sync_repo_to_worker() {
 }
 
 sync_weights() {
+    if [ "$MODEL_PATH_MODE" = "direct" ]; then
+        verify_local_model
+        if [ "${SKIP_SYNC:-0}" = "1" ]; then
+            worker_ssh "test -d '$WORKER_MODEL_PATH' && test -f '$WORKER_MODEL_PATH/config.json'" \
+                || die "SKIP_SYNC=1 but worker local MODEL_PATH is missing: $WORKER_MODEL_PATH"
+            if [ "$DFLASH_PATH_MODE" = "direct" ] && [ "$SPEC_METHOD" = "dflash" ]; then
+                worker_ssh "test -f '$WORKER_DFLASH_MODEL_PATH/config.json' && test -f '$WORKER_DFLASH_MODEL_PATH/model.safetensors'" \
+                    || die "SKIP_SYNC=1 but worker local DFLASH_MODEL_PATH is missing: $WORKER_DFLASH_MODEL_PATH"
+            fi
+            log "SKIP_SYNC=1 — using preloaded worker model path: $WORKER_MODEL_PATH"
+            return
+        fi
+        worker_ssh "mkdir -p '${WORKER_MODEL_PATH%/*}'"
+        log "syncing local model path to worker: $MODEL_PATH -> $WORKER_SSH:$WORKER_MODEL_PATH"
+        rsync -a --partial --info=progress2 \
+            "$MODEL_PATH/" "${WORKER_SSH}:${WORKER_MODEL_PATH}/"
+        worker_ssh "test -f '$WORKER_MODEL_PATH/config.json'" \
+            || die "worker local MODEL_PATH has no config.json after sync: $WORKER_MODEL_PATH"
+        if [ "$DFLASH_PATH_MODE" = "direct" ] && [ "$SPEC_METHOD" = "dflash" ]; then
+            worker_ssh "mkdir -p '${WORKER_DFLASH_MODEL_PATH%/*}'"
+            log "syncing local DFlash2 path to worker: $DFLASH_PATH -> $WORKER_SSH:$WORKER_DFLASH_MODEL_PATH"
+            rsync -a --partial --info=progress2 \
+                "$DFLASH_PATH/" "${WORKER_SSH}:${WORKER_DFLASH_MODEL_PATH}/"
+            worker_ssh "test -f '$WORKER_DFLASH_MODEL_PATH/config.json' && test -f '$WORKER_DFLASH_MODEL_PATH/model.safetensors'" \
+                || die "worker local DFLASH_MODEL_PATH is incomplete after sync: $WORKER_DFLASH_MODEL_PATH"
+        fi
+        log "worker local model path is ready"
+        return
+    fi
     [ "${SKIP_SYNC:-0}" = "1" ] && { log "SKIP_SYNC=1 — not syncing to worker"; return; }
     [ -d "$MODEL_PATH" ] || die "weights missing at $MODEL_PATH — run without SKIP_DOWNLOAD first"
     sync_repo_to_worker "$MODEL_PATH" "$MODEL_CACHE_NAME" "weights"
@@ -1193,6 +1317,16 @@ launch_cluster() {
     docker rm -f "$CONTAINER_HEAD" >/dev/null 2>&1 || true
     worker_ssh "docker rm -f '$CONTAINER_WORKER'" >/dev/null 2>&1 || true
 
+    local head_model_mount="" worker_model_mount=""
+    if [ "$MODEL_PATH_MODE" = "direct" ]; then
+        [ -d "$MODEL_ROOT" ] || die "local MODEL_ROOT does not exist: $MODEL_ROOT"
+        worker_ssh "test -d '$WORKER_MODEL_ROOT'" \
+            || die "worker MODEL_ROOT does not exist: $WORKER_MODEL_ROOT"
+        head_model_mount="-v '$MODEL_ROOT:$CONTAINER_MODEL_ROOT:ro'"
+        worker_model_mount="-v '$WORKER_MODEL_ROOT:$CONTAINER_MODEL_ROOT:ro'"
+        log "mounting local model root: head=$MODEL_ROOT -> $CONTAINER_MODEL_ROOT worker=$WORKER_MODEL_ROOT -> $CONTAINER_MODEL_ROOT"
+    fi
+
     mkdir -p "$CACHE_ROOT" "$TRITON_HOST_CACHE" "$TILELANG_HOST_CACHE"
     worker_ssh "mkdir -p '$WORKER_VLLM_CACHE' '$WORKER_TRITON_CACHE' '$WORKER_TILELANG_CACHE'"
     scp -q -o BatchMode=yes "$WORKER_SCRIPT" "${WORKER_SSH}:/tmp/${CONTAINER_WORKER}.sh"
@@ -1301,6 +1435,7 @@ launch_cluster() {
     log "starting worker on ${WORKER_SSH} (NCCL if=${WORKER_CX7_IF} hca=${WORKER_CX7_IB}) ..."
     worker_ssh "docker run -d --name '$CONTAINER_WORKER' \
         --gpus all --network host --ipc=host --shm-size 32g --stop-timeout 60 \
+        ${worker_model_mount} \
         --device /dev/infiniband --cap-add IPC_LOCK \
         --ulimit memlock=-1 --ulimit stack=67108864 \
         -v '$WORKER_CACHE_DIR:/root/.cache/huggingface' \
@@ -1336,6 +1471,7 @@ launch_cluster() {
     log "starting head (vLLM API :${PORT}; NCCL if=${HEAD_CX7_IF} hca=${HEAD_CX7_IB}) ..."
     VLLM_API_KEY="$VLLM_API_KEY" docker run -d --name "$CONTAINER_HEAD" \
         --gpus all --network host --ipc=host --shm-size 32g --stop-timeout 60 \
+        ${head_model_mount} \
         --device /dev/infiniband --cap-add IPC_LOCK \
         --ulimit memlock=-1 --ulimit stack=67108864 \
         -v "$HF_CACHE_DIR:/root/.cache/huggingface" \

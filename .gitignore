@@ -16,3 +16,4 @@ __pycache__/
 
 # bench artifacts (prefix-cache runs write here)
 results/
+.DS_store

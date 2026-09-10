@@ -453,6 +453,9 @@ cd GLM-5.3-Flash-EXL3-2x-DGX-Sparks
 cp .env.example .env          # edit HEAD_IP / WORKER_IP / WORKER_USER if needed
 ./download.sh                 # optional: EXL3 + DFlash2 into the head HF cache only
 ./start.sh                    # pull public GHCR :exl3, download if missing, rsync, launch TP=2
+# Or serve a preloaded local checkpoint on both nodes:
+MODEL_PATH=/opt/models/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw \
+MODEL_ROOT=/opt/models ./start.sh
 ```
 
 First run of `./start.sh` copies `.env.example` → `.env` if missing. Prefix env
@@ -617,7 +620,13 @@ that are now documented/enforced:
 | `WORKER_IP` | `10.0.0.2` | other Spark |
 | `WORKER_USER` | *(unset = `$USER`)* | SSH user on the worker |
 | `WORKER_HOME` | `$HOME` if same user, else `/home/$WORKER_USER` | worker HF cache |
-| `MODEL` | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` | Hub repo into the HF cache (mirror) |
+| `MODEL_PATH` | *(unset)* | Absolute local checkpoint path. When set, it is mounted into both containers and takes precedence over the derived Hub cache path |
+| `MODEL_ROOT` | *(derived from `MODEL_PATH`)* | Host root mounted into the containers at `CONTAINER_MODEL_ROOT` when using a local checkpoint |
+| `CONTAINER_MODEL_ROOT` | `/models` | Container mount point for `MODEL_ROOT` in local-checkpoint mode |
+| `WORKER_MODEL_PATH` | `MODEL_PATH` | Worker-side local checkpoint path; use this when the worker stores the model at a different path |
+| `MODEL` | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` | Hub repo used when `MODEL_PATH` is unset, and logical model id for logs |
+| `DFLASH_MODEL_PATH` | `$MODEL_ROOT/$DFLASH_MODEL` when present | Optional local DFlash2 checkpoint path; it is mounted with the target model and avoids a second Hub cache |
+| `WORKER_DFLASH_MODEL_PATH` | Matching path under `WORKER_MODEL_ROOT` | Worker-side DFlash2 path when it differs from the head path |
 | `MODEL_FALLBACK` | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` | Used if the mirror 404s or has fewer than 120 shards |
 | `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | OpenAI `model` id (`/v1/models`) |
 | `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` | public GHCR tag. Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull |
