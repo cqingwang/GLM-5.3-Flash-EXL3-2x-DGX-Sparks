@@ -1317,12 +1317,16 @@ launch_cluster() {
     docker rm -f "$CONTAINER_HEAD" >/dev/null 2>&1 || true
     worker_ssh "docker rm -f '$CONTAINER_WORKER'" >/dev/null 2>&1 || true
 
-    local head_model_mount="" worker_model_mount=""
+    local -a head_model_mount=()
+    local worker_model_mount=""
     if [ "$MODEL_PATH_MODE" = "direct" ]; then
         [ -d "$MODEL_ROOT" ] || die "local MODEL_ROOT does not exist: $MODEL_ROOT"
         worker_ssh "test -d '$WORKER_MODEL_ROOT'" \
             || die "worker MODEL_ROOT does not exist: $WORKER_MODEL_ROOT"
-        head_model_mount="-v '$MODEL_ROOT:$CONTAINER_MODEL_ROOT:ro'"
+        # Keep the local docker invocation as an argv array.  Embedding shell
+        # quotes in a scalar leaves the quote characters in the value, so
+        # Docker parses the bind mode as `ro'` and rejects it as `invalid mode`.
+        head_model_mount=(-v "$MODEL_ROOT:$CONTAINER_MODEL_ROOT:ro")
         worker_model_mount="-v '$WORKER_MODEL_ROOT:$CONTAINER_MODEL_ROOT:ro'"
         log "mounting local model root: head=$MODEL_ROOT -> $CONTAINER_MODEL_ROOT worker=$WORKER_MODEL_ROOT -> $CONTAINER_MODEL_ROOT"
     fi
@@ -1471,7 +1475,7 @@ launch_cluster() {
     log "starting head (vLLM API :${PORT}; NCCL if=${HEAD_CX7_IF} hca=${HEAD_CX7_IB}) ..."
     VLLM_API_KEY="$VLLM_API_KEY" docker run -d --name "$CONTAINER_HEAD" \
         --gpus all --network host --ipc=host --shm-size 32g --stop-timeout 60 \
-        ${head_model_mount} \
+        "${head_model_mount[@]}" \
         --device /dev/infiniband --cap-add IPC_LOCK \
         --ulimit memlock=-1 --ulimit stack=67108864 \
         -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
