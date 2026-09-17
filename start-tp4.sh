@@ -163,8 +163,13 @@ WORKER2_CX7_IF="${WORKER2_CX7_IF:-$WORKER_CX7_IF}"
 WORKER2_CX7_IB="${WORKER2_CX7_IB:-$WORKER_CX7_IB}"
 WORKER3_CX7_IF="${WORKER3_CX7_IF:-$WORKER_CX7_IF}"
 WORKER3_CX7_IB="${WORKER3_CX7_IB:-$WORKER_CX7_IB}"
+HEAD_SOCKET_IFACE="${HEAD_SOCKET_IFACE:-$HEAD_CX7_IF}"
+WORKER_SOCKET_IFACE="${WORKER_SOCKET_IFACE:-$WORKER_CX7_IF}"
+WORKER2_SOCKET_IFACE="${WORKER2_SOCKET_IFACE:-$WORKER2_CX7_IF}"
+WORKER3_SOCKET_IFACE="${WORKER3_SOCKET_IFACE:-$WORKER3_CX7_IF}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
+NCCL_ALGO="${NCCL_ALGO:-RING}"
 # The RoCEv2 GID index is per-NIC: the usable entry is the one whose GID matches
 # that node's own fabric IP. Most pairs share a good index; some do not (this kit
 # needs head=4, worker=3). Unset, both inherit NCCL_IB_GID_INDEX -> unchanged.
@@ -179,6 +184,8 @@ WORKER3_GID="${WORKER3_GID:-$NCCL_IB_GID_INDEX}"
 CG_ESTIMATE="${CG_ESTIMATE:-1}"
 NCCL_CROSS_NIC="${NCCL_CROSS_NIC:-1}"
 NCCL_HOST_DIR="${NCCL_HOST_DIR:-$HOME/nccl-2.30.7}"
+NCCL_PIN_HOST="${NCCL_PIN_HOST:-}"
+NCCL_PIN_CONTAINER="${NCCL_PIN_CONTAINER:-/opt/libncclpin.so}"
 WORKER_NCCL_HOST_DIR="${WORKER_NCCL_HOST_DIR:-$WORKER_HOME/nccl-2.30.7}"
 WORKER2_NCCL_HOST_DIR="${WORKER2_NCCL_HOST_DIR:-$WORKER2_HOME/nccl-2.30.7}"
 WORKER3_NCCL_HOST_DIR="${WORKER3_NCCL_HOST_DIR:-$WORKER3_HOME/nccl-2.30.7}"
@@ -308,10 +315,38 @@ CONTAINER_WORKER="${CONTAINER_WORKER:-glm53-exl3-tp4-w1}"
 CONTAINER_WORKER2="${CONTAINER_WORKER2:-glm53-exl3-tp4-w2}"
 CONTAINER_WORKER3="${CONTAINER_WORKER3:-glm53-exl3-tp4-w3}"
 
-HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
-MODEL_PATH="$HF_CACHE_DIR/hub/$MODEL_CACHE_NAME"
+MODEL_PATH_INPUT="${MODEL_PATH:-}"
+DFLASH_MODEL_PATH_INPUT="${DFLASH_MODEL_PATH:-}"
+MODEL_ROOT="${MODEL_ROOT:-}"
+CONTAINER_MODEL_ROOT="${CONTAINER_MODEL_ROOT:-/models}"
+if [[ "$MODEL_PATH_INPUT" = /* ]]; then
+    MODEL_PATH="$MODEL_PATH_INPUT"
+    MODEL_ROOT="${MODEL_ROOT:-${MODEL_PATH%/*/*}}"
+    MODEL_PATH_MODE=direct
+    HF_CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
+else
+    HF_CACHE_DIR="${HF_CACHE_DIR:-${HF_HOME:-$HOME/.cache/huggingface}}"
+    MODEL_PATH="$HF_CACHE_DIR/hub/$MODEL_CACHE_NAME"
+    MODEL_ROOT="${MODEL_ROOT:-$HF_CACHE_DIR}"
+    MODEL_PATH_MODE=hf-cache
+fi
 FALLBACK_MODEL_PATH="$HF_CACHE_DIR/hub/$MODEL_FALLBACK_CACHE_NAME"
-DFLASH_PATH="$HF_CACHE_DIR/hub/$DFLASH_CACHE_NAME"
+if [[ "$DFLASH_MODEL_PATH_INPUT" = /* ]]; then
+    DFLASH_PATH="$DFLASH_MODEL_PATH_INPUT"
+    DFLASH_PATH_MODE=direct
+else
+    DFLASH_PATH="$HF_CACHE_DIR/hub/$DFLASH_CACHE_NAME"
+    DFLASH_PATH_MODE=hf-cache
+fi
+WORKER_MODEL_PATH="${WORKER_MODEL_PATH:-$MODEL_PATH}"
+WORKER2_MODEL_PATH="${WORKER2_MODEL_PATH:-$WORKER_MODEL_PATH}"
+WORKER3_MODEL_PATH="${WORKER3_MODEL_PATH:-$WORKER_MODEL_PATH}"
+WORKER_MODEL_ROOT="${WORKER_MODEL_ROOT:-$MODEL_ROOT}"
+WORKER2_MODEL_ROOT="${WORKER2_MODEL_ROOT:-$WORKER_MODEL_ROOT}"
+WORKER3_MODEL_ROOT="${WORKER3_MODEL_ROOT:-$WORKER_MODEL_ROOT}"
+WORKER_DFLASH_PATH="${WORKER_DFLASH_PATH:-$DFLASH_PATH}"
+WORKER2_DFLASH_PATH="${WORKER2_DFLASH_PATH:-$WORKER_DFLASH_PATH}"
+WORKER3_DFLASH_PATH="${WORKER3_DFLASH_PATH:-$WORKER_DFLASH_PATH}"
 WORKER_CACHE_DIR="$WORKER_HOME/.cache/huggingface"
 WORKER2_CACHE_DIR="${WORKER2_CACHE_DIR:-$WORKER2_HOME/.cache/huggingface}"
 WORKER3_CACHE_DIR="${WORKER3_CACHE_DIR:-$WORKER3_HOME/.cache/huggingface}"
@@ -453,6 +488,27 @@ _tp4_rank_hf() {
         3) printf '%s' "$WORKER3_CACHE_DIR" ;;
     esac
 }
+_tp4_rank_model_path() {
+    case "$1" in
+        1) printf '%s' "$WORKER_MODEL_PATH" ;;
+        2) printf '%s' "$WORKER2_MODEL_PATH" ;;
+        3) printf '%s' "$WORKER3_MODEL_PATH" ;;
+    esac
+}
+_tp4_rank_model_root() {
+    case "$1" in
+        1) printf '%s' "$WORKER_MODEL_ROOT" ;;
+        2) printf '%s' "$WORKER2_MODEL_ROOT" ;;
+        3) printf '%s' "$WORKER3_MODEL_ROOT" ;;
+    esac
+}
+_tp4_rank_dflash() {
+    case "$1" in
+        1) printf '%s' "$WORKER_DFLASH_PATH" ;;
+        2) printf '%s' "$WORKER2_DFLASH_PATH" ;;
+        3) printf '%s' "$WORKER3_DFLASH_PATH" ;;
+    esac
+}
 _tp4_rank_vllm() {
     case "$1" in
         1) printf '%s' "$WORKER_VLLM_CACHE" ;;
@@ -488,11 +544,25 @@ _tp4_rank_cx7_ib() {
         3) printf '%s' "$WORKER3_CX7_IB" ;;
     esac
 }
+_tp4_rank_peer_hca() {
+    case "$1" in
+        1) printf '%s' "${PEER_HCA_RANK1:-}" ;;
+        2) printf '%s' "${PEER_HCA_RANK2:-}" ;;
+        3) printf '%s' "${PEER_HCA_RANK3:-}" ;;
+    esac
+}
 _tp4_rank_gid() {
     case "$1" in
         1) printf '%s' "$WORKER_GID" ;;
         2) printf '%s' "$WORKER2_GID" ;;
         3) printf '%s' "$WORKER3_GID" ;;
+    esac
+}
+_tp4_rank_socket_iface() {
+    case "$1" in
+        1) printf '%s' "$WORKER_SOCKET_IFACE" ;;
+        2) printf '%s' "$WORKER2_SOCKET_IFACE" ;;
+        3) printf '%s' "$WORKER3_SOCKET_IFACE" ;;
     esac
 }
 _tp4_rank_container() {
@@ -534,6 +604,14 @@ ensure_refs_main() {
 }
 
 resolve_model_dir() {
+    if [ "$MODEL_PATH_MODE" = direct ]; then
+        [ -f "$MODEL_PATH/config.json" ] || die "model config missing at $MODEL_PATH"
+        case "$MODEL_PATH" in
+            "$MODEL_ROOT"/*) printf '%s/%s' "$CONTAINER_MODEL_ROOT" "${MODEL_PATH#"$MODEL_ROOT"/}" ;;
+            *) die "MODEL_PATH=$MODEL_PATH must be under MODEL_ROOT=$MODEL_ROOT" ;;
+        esac
+        return
+    fi
     local ref="$MODEL_PATH/refs/main" hash dir
     ensure_refs_main
     hash="$(<"$ref")"
@@ -553,6 +631,14 @@ ensure_dflash_refs_main() {
 }
 
 resolve_dflash_dir() {
+    if [ "$DFLASH_PATH_MODE" = direct ]; then
+        [ -f "$DFLASH_PATH/config.json" ] || die "DFlash2 config missing at $DFLASH_PATH"
+        case "$DFLASH_PATH" in
+            "$MODEL_ROOT"/*) printf '%s/%s' "$CONTAINER_MODEL_ROOT" "${DFLASH_PATH#"$MODEL_ROOT"/}" ;;
+            *) die "DFLASH_MODEL_PATH=$DFLASH_PATH must be under MODEL_ROOT=$MODEL_ROOT" ;;
+        esac
+        return
+    fi
     local ref="$DFLASH_PATH/refs/main" hash dir
     ensure_dflash_refs_main
     hash="$(<"$ref")"
@@ -597,6 +683,18 @@ preflight() {
         worker_ssh_n "$r" "nvidia-smi -L 2>/dev/null | grep -q GB10" \
             || warn "no GB10 GPU visible on rank ${r} (${ssh_t})"
     done
+    if [ "$MODEL_PATH_MODE" = direct ]; then
+        [ -f "$MODEL_PATH/config.json" ] || die "head direct model path is incomplete: $MODEL_PATH"
+        for r in 1 2 3; do
+            worker_ssh_n "$r" "test -f '$(_tp4_rank_model_path "$r")/config.json'" \
+                || die "rank ${r} direct model path is incomplete: $(_tp4_rank_model_path "$r")"
+            if [ "$SPEC_METHOD" = dflash ]; then
+                worker_ssh_n "$r" "test -f '$(_tp4_rank_dflash "$r")/config.json'" \
+                    || die "rank ${r} direct DFlash2 path is incomplete: $(_tp4_rank_dflash "$r")"
+            fi
+        done
+        log "direct model assets present on head and all workers"
+    fi
 
     # Each rank's GID index must name a populated entry on ITS OWN CX7 device.
     # An empty (all-zero) entry passes every earlier check and then kills that
@@ -663,24 +761,23 @@ preflight() {
         log "ablit: ON (method=${ABLIT_METHOD} direction=${ABLIT_DIRECTION} layers=${ABLIT_LAYERS} alpha=${ABLIT_ALPHA} mtp=${ABLIT_INCLUDE_MTP})"
     fi
 
-    local need_kb=$((180 * 1024 * 1024)) avail
-    mkdir -p "$HF_CACHE_DIR"
-    avail=$(df -Pk "$HF_CACHE_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)
-    [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on head for a ~164 GiB model"
-    for r in 1 2 3; do
-        avail=$(worker_ssh_n "$r" "df -Pk '$(_tp4_rank_home "$r")' 2>/dev/null" | awk 'NR==2{print $4}' || true)
-        [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on rank ${r} for a ~164 GiB model"
-    done
+    if [ "$MODEL_PATH_MODE" != direct ]; then
+        local need_kb=$((180 * 1024 * 1024)) avail
+        mkdir -p "$HF_CACHE_DIR"
+        avail=$(df -Pk "$HF_CACHE_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)
+        [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on head for a ~164 GiB model"
+        for r in 1 2 3; do
+            avail=$(worker_ssh_n "$r" "df -Pk '$(_tp4_rank_home "$r")' 2>/dev/null" | awk 'NR==2{print $4}' || true)
+            [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on rank ${r} for a ~164 GiB model"
+        done
 
-    # The worker HF cache must be writable by the SSH user before the ~164 GiB
-    # sync starts. A root-owned ~/.cache/huggingface (prior sudo/docker
-    # prepare on the worker) otherwise fails mid-sync with a bare mkdir
-    # permission error. mkdir -p is idempotent and is what sync does anyway.
-    for r in 1 2 3; do
-        if ! worker_ssh_n "$r" "mkdir -p '$(_tp4_rank_hf "$r")/hub' && test -w '$(_tp4_rank_hf "$r")/hub'"; then
-            die "rank ${r} cannot write $(_tp4_rank_hf "$r")/hub — fix ownership, e.g. ssh $(_tp4_ssh_target "$r") \"sudo chown -R \$USER: '$(_tp4_rank_hf "$r")'\""
-        fi
-    done
+        # 只有 cache 模式需要 worker 可写；直接挂载模式明确保持 /opt/models 只读。
+        for r in 1 2 3; do
+            if ! worker_ssh_n "$r" "mkdir -p '$(_tp4_rank_hf "$r")/hub' && test -w '$(_tp4_rank_hf "$r")/hub'"; then
+                die "rank ${r} cannot write $(_tp4_rank_hf "$r")/hub — fix ownership, e.g. ssh $(_tp4_ssh_target "$r") \"sudo chown -R \$USER: '$(_tp4_rank_hf "$r")'\""
+            fi
+        done
+    fi
 
     log "preflight OK (head=$(hostname) ${HEAD_IP}, workers=${WORKER_SSH} ${WORKER2_SSH} ${WORKER3_SSH})"
 }
@@ -980,6 +1077,11 @@ hf_download_repo() {
 
 download_weights() {
     [ "${SKIP_DOWNLOAD:-0}" = "1" ] && { log "SKIP_DOWNLOAD=1 — skipping download check"; return; }
+    if [ "$MODEL_PATH_MODE" = direct ]; then
+        [ -f "$MODEL_PATH/config.json" ] || die "direct model path is incomplete: $MODEL_PATH"
+        log "direct model path ready: $MODEL_PATH"
+        return
+    fi
     if [ "${REFRESH_WEIGHTS:-0}" != "1" ] && adopt_complete_weights; then
         return
     fi
@@ -1012,6 +1114,11 @@ download_weights() {
 download_dflash() {
     [ "$SPEC_METHOD" = "dflash" ] || return 0
     [ "${SKIP_DOWNLOAD:-0}" = "1" ] && { log "SKIP_DOWNLOAD=1 — skipping DFlash2 download check"; return; }
+    if [ "$DFLASH_PATH_MODE" = direct ]; then
+        [ -f "$DFLASH_PATH/config.json" ] || die "direct DFlash2 path is incomplete: $DFLASH_PATH"
+        log "direct DFlash2 path ready: $DFLASH_PATH"
+        return
+    fi
     local have
     have="$(find "$DFLASH_PATH/snapshots" -name 'model.safetensors' 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
     if [ "${have:-0}" -ge 1 ] && [ "${REFRESH_WEIGHTS:-0}" != "1" ]; then
@@ -1031,6 +1138,14 @@ download_dflash() {
 
 # Head-only Hub fetch. No docker, no SSH, no worker rsync.
 download_only() {
+    if [ "$MODEL_PATH_MODE" = direct ]; then
+        [ -f "$MODEL_PATH/config.json" ] || die "direct model path is incomplete: $MODEL_PATH"
+        if [ "$SPEC_METHOD" = dflash ]; then
+            [ -f "$DFLASH_PATH/config.json" ] || die "direct DFlash2 path is incomplete: $DFLASH_PATH"
+        fi
+        log "direct model assets are already staged; download is not required"
+        return 0
+    fi
     local have
     resolve_hf_bin || die "no 'hf' / 'huggingface-cli' on PATH and no python huggingface_hub — pip install --user -U 'huggingface_hub[cli]' (or set HF_BIN=/path/to/hf)"
     mkdir -p "$HF_CACHE_DIR"
@@ -1095,6 +1210,22 @@ sync_repo_to_one_worker() {
 }
 
 sync_weights() {
+    if [ "$MODEL_PATH_MODE" = direct ]; then
+        [ -f "$MODEL_PATH/config.json" ] || die "direct model path is incomplete: $MODEL_PATH"
+        local r worker_model worker_dflash
+        for r in 1 2 3; do
+            worker_model="$(_tp4_rank_model_path "$r")"
+            worker_ssh_n "$r" "test -f '$worker_model/config.json'" \
+                || die "rank ${r} direct model path is incomplete: $worker_model"
+            if [ "$SPEC_METHOD" = dflash ]; then
+                worker_dflash="$(_tp4_rank_dflash "$r")"
+                worker_ssh_n "$r" "test -f '$worker_dflash/config.json'" \
+                    || die "rank ${r} direct DFlash2 path is incomplete: $worker_dflash"
+            fi
+        done
+        log "direct model paths verified on all ranks — no model rsync"
+        return
+    fi
     [ "${SKIP_SYNC:-0}" = "1" ] && { log "SKIP_SYNC=1 — not syncing to workers"; return; }
     [ -d "$MODEL_PATH" ] || die "weights missing at $MODEL_PATH — run without SKIP_DOWNLOAD first"
     local r
@@ -1371,6 +1502,7 @@ TP4_SKIP_OLD_SCP
         -e NCCL_IB_DISABLE=0
         -e NCCL_IB_ROCE_VERSION_NUM=2
         -e NCCL_NET=IB
+        -e "NCCL_ALGO=$NCCL_ALGO"
         -e NCCL_NET_PLUGIN=none
         -e NCCL_NVLS_ENABLE=0
         -e NCCL_CUMEM_ENABLE=0
@@ -1409,8 +1541,15 @@ TP4_SKIP_OLD_SCP
     local -a head_preload=()
     if [ "$USE_HOST_NCCL" = "1" ]; then
         if [ -f "$NCCL_HOST_DIR/$NCCL_SO_NAME" ]; then
-            head_preload=(-v "$NCCL_HOST_DIR:/nccl:ro" -e "LD_PRELOAD=/nccl/$NCCL_SO_NAME")
-            log "head: LD_PRELOAD $NCCL_SO_NAME"
+            head_preload=(-v "$NCCL_HOST_DIR:/nccl:ro")
+            if [ -n "$NCCL_PIN_HOST" ] && [ -f "$NCCL_PIN_HOST" ]; then
+                head_preload+=(-v "$NCCL_PIN_HOST:$NCCL_PIN_CONTAINER:ro"
+                    -e "LD_PRELOAD=$NCCL_PIN_CONTAINER /nccl/$NCCL_SO_NAME")
+                log "head: LD_PRELOAD $NCCL_PIN_CONTAINER /nccl/$NCCL_SO_NAME"
+            else
+                head_preload+=(-e "LD_PRELOAD=/nccl/$NCCL_SO_NAME")
+                log "head: LD_PRELOAD $NCCL_SO_NAME"
+            fi
         else
             warn "head: $NCCL_HOST_DIR/$NCCL_SO_NAME missing — using image NCCL"
         fi
@@ -1434,25 +1573,38 @@ TP4_SKIP_OLD_SCP
     # beyond the container env (same as the DeepSeek deployment).
     serve_env+=" -e VLLM_API_KEY='${VLLM_API_KEY:-}'"
 
-    local worker_preload="" nccl_dir cname
+    local worker_preload="" nccl_dir cname worker_model_mount worker_hf_mount
     for r in 1 2 3; do
         worker_preload=""
         if [ "$USE_HOST_NCCL" = "1" ]; then
             nccl_dir="$(_tp4_rank_nccl_dir "$r")"
             if worker_ssh_n "$r" "test -f '$nccl_dir/$NCCL_SO_NAME'"; then
-                worker_preload="-v '$nccl_dir:/nccl:ro' -e LD_PRELOAD='/nccl/$NCCL_SO_NAME'"
-                log "rank ${r}: LD_PRELOAD $NCCL_SO_NAME"
+                worker_preload="-v '$nccl_dir:/nccl:ro'"
+                if [ -n "$NCCL_PIN_HOST" ] && worker_ssh_n "$r" "test -f '$NCCL_PIN_HOST'"; then
+                    worker_preload+=" -v '$NCCL_PIN_HOST:$NCCL_PIN_CONTAINER:ro' -e LD_PRELOAD='$NCCL_PIN_CONTAINER /nccl/$NCCL_SO_NAME'"
+                    log "rank ${r}: LD_PRELOAD $NCCL_PIN_CONTAINER /nccl/$NCCL_SO_NAME"
+                else
+                    worker_preload+=" -e LD_PRELOAD='/nccl/$NCCL_SO_NAME'"
+                    log "rank ${r}: LD_PRELOAD $NCCL_SO_NAME"
+                fi
             else
                 warn "rank ${r}: $nccl_dir/$NCCL_SO_NAME missing — using image NCCL"
             fi
         fi
         cname="$(_tp4_rank_container "$r")"
-        log "starting rank ${r} on $(_tp4_ssh_target "$r") (NCCL if=$(_tp4_rank_cx7_if "$r") hca=$(_tp4_rank_cx7_ib "$r")) ..."
+        worker_model_mount=""
+        worker_hf_mount=""
+        if [ "$MODEL_PATH_MODE" = direct ]; then
+            worker_model_mount="-v '$(_tp4_rank_model_root "$r"):$CONTAINER_MODEL_ROOT:ro'"
+        else
+            worker_hf_mount="-v '$(_tp4_rank_hf "$r"):/root/.cache/huggingface'"
+        fi
+        log "starting rank ${r} on $(_tp4_ssh_target "$r") (socket=$(_tp4_rank_socket_iface "$r") fabric=$(_tp4_rank_cx7_if "$r") hca=$(_tp4_rank_cx7_ib "$r")) ..."
         worker_ssh_n "$r" "docker run -d --name '$cname' \
             --gpus all --network host --ipc=host --shm-size 32g --stop-timeout 60 \
             --device /dev/infiniband --cap-add IPC_LOCK \
             --ulimit memlock=-1 --ulimit stack=67108864 \
-            -v '$(_tp4_rank_hf "$r"):/root/.cache/huggingface' \
+            ${worker_hf_mount} ${worker_model_mount} \
             -v '$(_tp4_rank_vllm "$r"):/root/.cache/vllm' \
             -v '$(_tp4_rank_triton "$r"):/root/.triton/cache' \
             -v '$(_tp4_rank_tilelang "$r"):/root/.tilelang/cache' \
@@ -1471,22 +1623,29 @@ TP4_SKIP_OLD_SCP
             -v '/tmp/patch_ablit.py:/opt/glm53/patch_ablit.py:ro' \
             ${worker_preload} \
             ${worker_nccl} \
-            -e NCCL_SOCKET_IFNAME='$(_tp4_rank_cx7_if "$r")' \
-            -e GLOO_SOCKET_IFNAME='$(_tp4_rank_cx7_if "$r")' \
+            -e NCCL_SOCKET_IFNAME='$(_tp4_rank_socket_iface "$r")' \
+            -e GLOO_SOCKET_IFNAME='$(_tp4_rank_socket_iface "$r")' \
             -e NCCL_IB_HCA='$(_tp4_rank_cx7_ib "$r")' \
             -e NCCL_IB_GID_INDEX='$(_tp4_rank_gid "$r")' \
+            -e NCCL_IB_PEER_HCA='$(_tp4_rank_peer_hca "$r")' \
             -e VLLM_HOST_IP='$(_tp4_rank_ip "$r")' \
             -e NODE_RANK='$r' \
             ${serve_env} \
             --entrypoint bash '$IMAGE' /start.sh" >/dev/null
     done
 
-    log "starting head (vLLM API :${PORT}; NCCL if=${HEAD_CX7_IF} hca=${HEAD_CX7_IB}) ..."
+    local -a head_model_mount=()
+    if [ "$MODEL_PATH_MODE" = direct ]; then
+        head_model_mount=(-v "$MODEL_ROOT:$CONTAINER_MODEL_ROOT:ro")
+    else
+        head_model_mount=(-v "$HF_CACHE_DIR:/root/.cache/huggingface")
+    fi
+    log "starting head (vLLM API :${PORT}; socket=${HEAD_SOCKET_IFACE} fabric=${HEAD_CX7_IF} hca=${HEAD_CX7_IB}) ..."
     docker run -d --name "$CONTAINER_HEAD" \
         --gpus all --network host --ipc=host --shm-size 32g --stop-timeout 60 \
         --device /dev/infiniband --cap-add IPC_LOCK \
         --ulimit memlock=-1 --ulimit stack=67108864 \
-        -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
+        "${head_model_mount[@]}" \
         -v "$CACHE_ROOT:/root/.cache/vllm" \
         -v "$TRITON_HOST_CACHE:/root/.triton/cache" \
         -v "$TILELANG_HOST_CACHE:/root/.tilelang/cache" \
@@ -1505,10 +1664,11 @@ TP4_SKIP_OLD_SCP
         -v "$SCRIPT_DIR/overlay/patch_ablit.py:/opt/glm53/patch_ablit.py:ro" \
         "${head_preload[@]}" \
         "${nccl_common[@]}" \
-        -e NCCL_SOCKET_IFNAME="$HEAD_CX7_IF" \
-        -e GLOO_SOCKET_IFNAME="$HEAD_CX7_IF" \
+        -e NCCL_SOCKET_IFNAME="$HEAD_SOCKET_IFACE" \
+        -e GLOO_SOCKET_IFNAME="$HEAD_SOCKET_IFACE" \
         -e NCCL_IB_HCA="$HEAD_CX7_IB" \
         -e NCCL_IB_GID_INDEX="$HEAD_GID" \
+        -e NCCL_IB_PEER_HCA="${PEER_HCA_RANK0:-}" \
         -e VLLM_HOST_IP="$HEAD_IP" \
         -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
         -e PORT="$PORT" -e TP="$TP" -e NNODES="$NNODES" \
