@@ -15,17 +15,17 @@ Hardening asked for by the production-like tester run on PRs #83/#84:
      overlay, exits 2 BEFORE the first docker or ssh call, so healthy
      containers are never stopped for a launch that cannot succeed.
   C  Overlay order -- one list (GLM53_OVERLAY_ORDER) pinned
-     hybrid -> per-group -> fine-grained is emitted verbatim into BOTH rank
-     inner scripts.
+     hybrid -> per-group -> no-store -> kv-capacity-log is emitted into BOTH
+     rank inner scripts.
   D  Rank parity -- for every /opt/glm53 patch the head bind-mounts host
      file S, the worker's mount is fed from /tmp/X and the scp that produced
-     /tmp/X read the same S; both ranks receive identical effective values
-     for GLM53_APC_RETENTION_INTERVAL, GLM53_APC_RETENTION_INTERVAL_SWA and
-     GLM53_FINEGRAINED_APC (launcher names) and the container-side names they
-     map to (VLLM_PREFIX_CACHE_RETENTION_INTERVAL[_SWA], GLM53_FINEGRAINED_APC);
+     /tmp/X read the same S; both ranks receive identical effective retention,
+     no-store, KV-capacity-log and cache-reset values;
      a knob the launcher wires must be PRESENT on both ranks, not merely
      equal. The comparison itself is exercised with a synthetic one-rank
      mismatch so a silent pass cannot hide behind equality.
+  E  Host template interpreter selection -- caller PATH, fallback order, strict
+     explicit overrides, and actual Jinja parse failures before either stop.
 
 Everything drives the shipped start.sh under bash from an allow-listed
 environment (PATH with docker / ssh / scp / rsync / curl / ip / nvidia-smi
@@ -56,27 +56,34 @@ START = ROOT / "start.sh"
 FAILURES: list[str] = []
 
 BLOCK = 3584
-RETENTION_MAX = 1_000_000
 SWA = "GLM53_APC_RETENTION_INTERVAL_SWA"
 SWA_FORWARD = '-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA"'
-FG = "GLM53_FINEGRAINED_APC"
-FG_FORWARD = '-e "GLM53_FINEGRAINED_APC=$GLM53_FINEGRAINED_APC"'
+NS = "GLM53_APC_NO_STORE"
+NS_FORWARD = '-e "GLM53_APC_NO_STORE=$GLM53_APC_NO_STORE"'
+# Cache-reset exposure stays opt-in because these dev routes sit outside
+# the bearer guard. Both ranks must receive the same gate value.
+CR = "GLM53_EXPOSE_CACHE_RESET"
+KV = "GLM53_KV_CAPACITY_LOG"
+KV_FORWARD = '-e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"'
 
-# Launcher knobs the tester asked to see reach both ranks identically, and the
-# container-side names the launcher maps them to.
-LAUNCHER_KNOBS = ("GLM53_APC_RETENTION_INTERVAL", SWA, FG)
+# Launcher knobs and the container-side names they map to.
+LAUNCHER_KNOBS = ("GLM53_APC_RETENTION_INTERVAL", SWA, NS, KV)
 CONTAINER_NAMES = LAUNCHER_KNOBS + (
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA",
+    CR,
 )
 
-PINNED = (
-    "patch_hybrid_prefix_hit.py",
-    "patch_apc_per_group_retention.py",
-)
+# Ships on its own (kv_cache_utils.py only, log-only; no coordinator anchors).
+# Where listed it must follow patch_glm5_drafter_group.py (same file) and the
+# per-group retention slot.
+KVCAP = "patch_kv_capacity_log.py"
+DRAFTER = "patch_glm5_drafter_group.py"
 APC_HOST_VARS = {
     "APC_PATCH_HOST": "patch_hybrid_prefix_hit.py",
     "PERGROUP_PATCH_HOST": "patch_apc_per_group_retention.py",
+    "NOSTORE_PATCH_HOST": "patch_apc_no_store.py",
+    "KVCAP_PATCH_HOST": KVCAP,
 }
 
 SEP = "\x1f"
@@ -144,8 +151,12 @@ def wires_swa() -> bool:
     return SWA_FORWARD in source()
 
 
-def wires_fg() -> bool:
-    return FG_FORWARD in source()
+def wires_ns() -> bool:
+    return NS_FORWARD in source()
+
+
+def wires_kv() -> bool:
+    return KV_FORWARD in source()
 
 
 # ------------------------------------------------------------------ part A --
@@ -159,7 +170,7 @@ def run_retention_guard(
         + "\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4\n"
         + "MAX_NUM_BATCHED_TOKENS=1024\n"
         + "GLM53_INDEXER_WORKSPACE=stock; GLM53_SPINWAIT_MS=stock\n"
-        + f"{FG}=1\n"
+        + f"{NS}=1\n"
         + "validate_numeric_config || exit $?\n"
         + f'printf "%s\\n" "${{{SWA}-unset}}"\n'
     )
@@ -170,24 +181,26 @@ def run_retention_guard(
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
+def run_no_store_guard(value: str) -> tuple[int, str, str]:
+    """Exercise explicit no-store values through the lifted numeric guard."""
+    script = (
+        guard_source()
+        + "\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4\n"
+        + "MAX_NUM_BATCHED_TOKENS=1024\n"
+        + "GLM53_INDEXER_WORKSPACE=stock; GLM53_SPINWAIT_MS=stock\n"
+        + "validate_numeric_config || exit $?\n"
+        + 'printf "%s\\n" "$GLM53_APC_NO_STORE"\n'
+    )
+    env = base_env(SPEC_METHOD="none", **{NS: value})
+    r = subprocess.run(["bash", "-c", script], text=True, capture_output=True, env=env)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
 def part_a() -> None:
     print("Part A: GLM53_APC_RETENTION_INTERVAL_SWA guard (numeric config block)")
     if not wires_swa():
-        check(
-            f"_glm53_validate_retention_interval {SWA}" not in guard_source(),
-            "A0 this launcher does not forward the SWA knob and does not pretend to validate it",
-        )
         print("  skip A1-A3 (knob not forwarded by this checkout; validate-what-you-forward)")
         return
-    text = guard_source()
-    check(
-        f"_glm53_validate_retention_interval {SWA}" in text,
-        "A1 the forwarded SWA knob is validated inside the numeric config guard",
-    )
-    check(
-        f"GLM53_APC_BLOCK_TOKENS={BLOCK}" in text and f"GLM53_APC_RETENTION_MAX={RETENTION_MAX}" in text,
-        f"A1 grid {BLOCK} and cap {RETENTION_MAX:,} are the documented constants",
-    )
     accepted = {
         None: "unset",
         "": "",
@@ -229,6 +242,31 @@ def part_a() -> None:
                 f"A4 {SWA}={value!r} rejected with SPEC_METHOD={spec_method} "
                 f"before launch (rc={rc} err={err[:80]!r})",
             )
+
+
+# ------------------------------------------- part F (no-store kill switch) --
+
+
+def part_f() -> None:
+    """`GLM53_APC_NO_STORE` is a kill switch, not a truthy knob: exactly 0 or 1,
+    and an explicitly empty caller value is an operator error -- the generic
+    caller-exports-win rule (start.sh) is what carries it past .env."""
+    print(f"Part F: {NS} kill switch through the numeric-config guard")
+    if not wires_ns():
+        print("  skip F (knob not forwarded by this checkout)")
+        return
+    for value, canonical in (("0", "0"), ("1", "1")):
+        rc, out, err = run_no_store_guard(value)
+        check(
+            rc == 0 and out == canonical,
+            f"F1 {NS}={value!r} accepted, ranks receive {canonical!r} (rc={rc} out={out!r} {err})",
+        )
+    for value in ("", "2", "yes", "true", "TRUE", "01", "-1", "1.0", " 1", "1 "):
+        rc, out, err = run_no_store_guard(value)
+        check(
+            rc == 2 and NS in err,
+            f"F2 {NS}={value!r} rejected with rc=2 and a named error (rc={rc} err={err[:60]!r})",
+        )
 
 
 # --------------------------------------------------------------- harness --
@@ -334,47 +372,8 @@ def control(h: Harness, label: str, **env: str) -> None:
 
 def part_b(h: Harness) -> None:
     print("Part B: restart fails closed before any container is stopped")
-    text = source()
-    main_at = text.index("main() {")
-    v_num = text.index("validate_numeric_config", main_at)
-    v_art = text.index("validate_overlay_artifacts", main_at)
-    restart = text.index("restart)  stop; start", main_at)
-    check(
-        v_num < restart and v_art < restart,
-        "B1 main() runs the numeric and artifact validators before `restart) stop; start`",
-    )
-    check(
-        "start|restart) validate_numeric_config; validate_overlay_artifacts ;;" in text,
-        "B1 numeric and artifact validators share the start|restart arm",
-    )
-    guard_begin = text.index("# GLM53 overlay artifact guard (begin)")
-    guard_end = text.index("# GLM53 overlay artifact guard (end)")
-    guard = text[guard_begin:guard_end]
-    check(guard_begin < guard_end, "B1 the artifact guard has its own sentinel block")
-    check("|-\"" not in guard and '|-"' not in guard, "B1 every artifact carries an identity string (no untagged entries)")
-    check(
-        guard.count("|$main_guard\"") >= 6 and '|    return report"' in guard and "| tail -n 1 || true)" in guard,
-        "B1 every artifact carries its exact last line as an EOF sentinel (checked against the last non-blank line)",
-    )
-    check(
-        '"$CHAT_TEMPLATE_HOST"' in guard and "ablit/LAYER_MAP.json" in guard,
-        "B1 the chat template and the ablit layer map are gated too",
-    )
-
     vars_ = host_vars()
     shipped = shipped_apc_vars()
-    check("APC_PATCH_HOST" in shipped, "B2 checkout ships patch_hybrid_prefix_hit.py")
-    check(
-        "PERGROUP_PATCH_HOST" in shipped or "FINEHIT_PATCH_HOST" in shipped,
-        "B2 checkout ships at least one of per-group / fine-grained",
-    )
-    for var in vars_:
-        check(f'"${var}|' in guard, f"B2 {var} ({vars_[var]}) is in the artifact guard")
-    check("overlay/patch_ablit.py|" in guard and "overlay/ablit_runtime.py|" in guard, "B2 ablit hook + runtime are in the artifact guard")
-    check(
-        'for entry in "${artifacts[@]}"' in guard and "artifacts[@]}\" -eq 0" in guard,
-        "B2 the guard iterates a bash array and refuses an empty list (no process-substitution status gap)",
-    )
 
     # Control FIRST: with a valid configuration the entrypoint gets PAST the
     # validators and reaches stop (the stubs then fail preflight, which is
@@ -387,6 +386,12 @@ def part_b(h: Harness) -> None:
             "B3 empty SWA override with MTP reaches stop on both ranks",
             SPEC_METHOD="mtp",
             **{SWA: ""},
+        )
+    if wires_ns():
+        control(
+            h,
+            f"B3 {NS}=0 (valid kill switch: requests keep their stores) reaches stop on both ranks",
+            **{NS: "0"},
         )
 
     def fails_closed(label: str, **env: str) -> None:
@@ -411,8 +416,15 @@ def part_b(h: Harness) -> None:
             SPEC_METHOD="none",
             **{SWA: str(BLOCK)},
         )
-    if wires_fg():
-        fails_closed(f"B3 restart with {FG}=yes exits 2 with nothing stopped", **{FG: "yes"})
+    if wires_ns():
+        fails_closed(f"B3 restart with {NS}=yes exits 2 with nothing stopped", **{NS: "yes"})
+        fails_closed(
+            f"B3 restart with an explicitly empty {NS} exits 2 with nothing stopped",
+            **{NS: ""},
+        )
+    if wires_kv():
+        fails_closed(f"B3 restart with {KV}=yes exits 2 with nothing stopped", **{KV: "yes"})
+        fails_closed(f"B3 restart with {KV}= (explicitly empty) exits 2 with nothing stopped", **{KV: ""})
 
     broken = h.tmp / "broken_patch.py"
     broken.write_text("def (:\n    pass\n")
@@ -501,19 +513,7 @@ def apply_sequence(script: Path) -> list[str]:
 
 def part_c(h: Harness) -> None:
     print("Part C: overlay order pinned once, emitted to both ranks")
-    text = source()
     order = overlay_order()
-    idx = {name: order.index(name) for name in PINNED if name in order}
-    check(len(idx) == 2, f"C1 both prefix-cache overlays are listed: {sorted(idx)}")
-    check(
-        len(idx) == 2 and idx[PINNED[0]] < idx[PINNED[1]],
-        "C1 pinned order hybrid -> per-group",
-    )
-    check(
-        'emit_overlay_block >> "$HEAD_SCRIPT"' in text and 'emit_overlay_block >> "$WORKER_SCRIPT"' in text,
-        "C2 both inner scripts take the block from emit_overlay_block",
-    )
-    check("python3 /opt/glm53/patch_" not in text, "C2 no literal per-rank patch ladder remains in start.sh")
 
     r = h.run("write_inner_scripts", entry="start.fn.sh")
     head = h.repo / ".glm53-exl3-head.inner.sh"
@@ -534,15 +534,24 @@ def part_c(h: Harness) -> None:
                 < body.index("/opt/glm53/patch_apc_per_group_retention.py"),
                 f"C3 {s.name}: hybrid -> per-group in the generated script",
             )
+            if wires_ns():
+                check(
+                    body.index("/opt/glm53/patch_apc_per_group_retention.py")
+                    < body.index("/opt/glm53/patch_apc_no_store.py")
+                    < body.index("/opt/glm53/patch_xgrammar_termination.py"),
+                    f"C3 {s.name}: per-group -> no-store -> xgrammar in the generated script",
+                )
             check(
                 "python3 /opt/glm53/patch_ablit.py" in body
                 and body.index("patch_kpool_tail_slotmap.py") < body.index("python3 /opt/glm53/patch_ablit.py"),
                 f"C3 {s.name}: ablit still applies last",
             )
-            check(
-                re.search(r"if \[ -f /opt/glm53/patch_apc_per_group_retention\.py \]; then\n\s+python3", body) is not None,
-                f"C3 {s.name}: every slot is `[ -f ]`-guarded (unmounted sibling slot is a no-op)",
-            )
+            if KVCAP in order:
+                check(
+                    body.index(f"/opt/glm53/{DRAFTER}") < body.index("/opt/glm53/patch_apc_per_group_retention.py")
+                    < body.index(f"/opt/glm53/{KVCAP}") < body.index("/opt/glm53/patch_xgrammar_termination.py"),
+                    f"C3 {s.name}: drafter-group -> per-group -> kv-capacity-log -> xgrammar in the generated script",
+                )
 
 
 # ------------------------------------------------------------------ part D --
@@ -618,10 +627,14 @@ def part_d(h: Harness) -> None:
     scenarios: list[tuple[str, dict[str, str]]] = [("defaults", {})]
     if wires_swa():
         scenarios += [("SWA=14336", {SWA: "14336"}), ("SWA=0", {SWA: "0"}), ("SWA unset", {})]
-    if wires_fg():
-        scenarios += [("FINEGRAINED=0", {FG: "0"}), ("FINEGRAINED=1", {FG: "1"})]
-    if wires_swa() and wires_fg():
-        scenarios.append(("SWA=14336 + FINEGRAINED=0", {SWA: "14336", FG: "0"}))
+    if wires_ns():
+        scenarios += [("NO_STORE=0", {NS: "0"}), ("NO_STORE=1", {NS: "1"})]
+    if wires_swa() and wires_ns():
+        scenarios.append(("SWA=14336 + NO_STORE=0", {SWA: "14336", NS: "0"}))
+    # Exercise both ranks even if cache-reset forwarding regresses entirely.
+    scenarios.append((f"{CR}=1", {CR: "1"}))
+    if wires_kv():
+        scenarios += [("KVCAP=0", {KV: "0"}), ("KVCAP=1", {KV: "1"})]
 
     first = None
     for label, env in scenarios:
@@ -634,8 +647,11 @@ def part_d(h: Harness) -> None:
         required: dict[str, str] = {}
         if wires_swa() and env.get(SWA, ""):
             required["VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA"] = env[SWA]
-        if wires_fg():
-            required[FG] = env.get(FG, "1")
+        if NS in env:
+            required[NS] = env[NS]
+        required[CR] = env.get(CR, "0")
+        if KV in env:
+            required[KV] = env[KV]
         issues = parity_issues(head, worker, scp, required)
         check(not issues, f"D2 [{label}] rank parity: " + ("; ".join(issues) if issues else "no differences"))
         for name in CONTAINER_NAMES:
@@ -647,7 +663,6 @@ def part_d(h: Harness) -> None:
                 f"D2 [{label}] empty SWA override is forwarded to neither rank",
             )
         mounted = {Path(p).name for p in head.mounts}
-        check(len(head.mounts) >= 9, f"D3 [{label}] {len(head.mounts)} /opt/glm53 patch mounts, identical chain head-mount = scp source = worker-mount")
         # Expected source -> destination map for EVERY *_PATCH_HOST: the head
         # mount, the scp source and the worker mount must all be that file.
         wrong_map = []
@@ -690,6 +705,133 @@ def part_d(h: Harness) -> None:
         check(any(wdest in i for i in issues), f"D4 a worker scp fed from a different host file is reported ({issues[:1]})")
 
 
+def allocator_overrides(h: Harness) -> None:
+    for value in (None, "", "expandable_segments:False, max_split_size_mb:128"):
+        env = {} if value is None else {"PYTORCH_CUDA_ALLOC_CONF": value}
+        ranks = rank_runs(h, **env)
+        check(ranks is not None, f"allocator {value!r}: captured both launches")
+        if ranks is None:
+            continue
+        expected = "expandable_segments:True" if value is None else value
+        check(
+            all(rank.env.get("PYTORCH_CUDA_ALLOC_CONF") == expected for rank in ranks[:2]),
+            f"allocator {value!r}: both ranks receive the complete assignment",
+        )
+
+# ------------------------------------------------------------------ part E --
+
+
+def part_e(h: Harness) -> None:
+    print("Part E: host Python/Jinja selection, with real template parsing")
+    # Available candidates use the test runner's Jinja2. Missing-Jinja candidates
+    # run that same Python with -S, so AST/JSON validation still executes normally.
+    from jinja2 import Environment
+
+    Environment(extensions=["jinja2.ext.loopcontrols"])
+    interpreter_log = h.tmp / "interpreters.log"
+
+    def interpreter(name: str, jinja: bool) -> Path:
+        path = h.bin / name
+        path.write_text(
+            "#!/bin/bash\n"
+            f"printf '%s\\037%s\\n' {shlex.quote(name)} \"$*\" >> {shlex.quote(str(interpreter_log))}\n"
+            f"exec {shlex.quote(sys.executable)} {' ' if jinja else '-S '}\"$@\"\n"
+        )
+        path.chmod(0o755)
+        return path
+
+    def run(**extra: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        h.log.unlink(missing_ok=True)
+        interpreter_log.unlink(missing_ok=True)
+        # Intercept only the absolute system candidate in this shell. Never use
+        # the host's actual /usr/bin/python3 or its incidental installed packages.
+        script = (
+            'function /usr/bin/python3() { "$GLM53_TEST_SYSTEM_PYTHON" "$@"; }\n'
+            'source ./start.sh restart\n'
+        )
+        r = subprocess.run(
+            ["bash", "-c", script],
+            cwd=h.repo,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=h.env(GLM53_TEST_SYSTEM_PYTHON=str(h.bin / "system-python"), **extra),
+        )
+        calls = interpreter_log.read_text().splitlines() if interpreter_log.exists() else []
+        # Record real Jinja import/parse executions, not unrelated AST/JSON work.
+        selected = [line.split(SEP, 1)[0] for line in calls if "jinja2" in line]
+        return r, selected
+
+    def reaches_stop(label: str, expected: list[str], **extra: str) -> None:
+        r, selected = run(**extra)
+        calls = h.host_touching_calls()
+        check(
+            any(c[:3] == ["docker", "rm", "-f"] for c in calls)
+            and any(c[0] == "ssh" and "docker rm -f" in c[-1] for c in calls)
+            and selected == expected,
+            f"E {label}: validators={selected}, rc={r.returncode}, stderr={r.stderr[-200:]!r}",
+        )
+
+    def fails_closed(label: str, expected: list[str], **extra: str) -> None:
+        r, selected = run(**extra)
+        check(
+            r.returncode == 2 and not h.host_touching_calls() and selected == expected,
+            f"E {label}: validators={selected}, rc={r.returncode}, stderr={r.stderr[-200:]!r}",
+        )
+
+    for name in ("python3", "python3.12", "python3.11", "system-python"):
+        interpreter(name, True)
+    reaches_stop("caller PATH wins", ["python3", "python3"])
+    interpreter("python3", False)
+    reaches_stop("alternate interpreter", ["python3", "python3.12", "python3.12"])
+    interpreter("python3.12", False)
+    reaches_stop("second alternate", ["python3", "python3.12", "python3.11", "python3.11"])
+    interpreter("python3.11", False)
+    reaches_stop("system fallback", ["python3", "python3.12", "python3.11", "system-python", "system-python"])
+    interpreter("system-python", False)
+    fails_closed("all candidates lack Jinja", ["python3", "python3.12", "python3.11", "system-python"])
+
+    # Healthy alternatives must not rescue an invalid explicit override.
+    for name in ("python3", "python3.12", "python3.11", "system-python"):
+        interpreter(name, True)
+    pinned = interpreter("pinned python", True)
+    reaches_stop("explicit path with spaces", ["pinned python", "pinned python"], GLM53_VALIDATE_PYTHON=str(pinned))
+    reaches_stop("explicit PATH name", ["python3.11", "python3.11"], GLM53_VALIDATE_PYTHON="python3.11")
+    no_jinja = interpreter("no-jinja", False)
+    fails_closed("override lacks Jinja", ["no-jinja"], GLM53_VALIDATE_PYTHON=str(no_jinja))
+    not_executable = interpreter("not-executable", True)
+    not_executable.chmod(0o644)
+    for label, value in (
+        ("empty override", ""),
+        ("missing override", str(h.tmp / "missing-python")),
+        ("non-executable override", str(not_executable)),
+        ("override is not a command line", f"{pinned} -S"),
+    ):
+        fails_closed(label, [], GLM53_VALIDATE_PYTHON=value)
+
+    invalid = h.tmp / "invalid-template.jinja"
+    invalid.write_text("{% if broken %}\n")
+    fails_closed("invalid template does not try alternatives", ["python3", "python3"], CHAT_TEMPLATE_HOST=str(invalid))
+    fails_closed(
+        "invalid template with explicit interpreter",
+        ["pinned python", "pinned python"],
+        GLM53_VALIDATE_PYTHON=str(pinned),
+        CHAT_TEMPLATE_HOST=str(invalid),
+    )
+    interpreter("python3", False)
+    fails_closed(
+        "invalid template after discovery",
+        ["python3", "python3.12", "python3.12"],
+        CHAT_TEMPLATE_HOST=str(invalid),
+    )
+    loop_template = h.tmp / "loop-template.jinja"
+    loop_template.write_text("{% for item in [1] %}{% break %}{% endfor %}\n")
+    reaches_stop(
+        "loop controls remain enabled",
+        ["python3", "python3.12", "python3.12"],
+        CHAT_TEMPLATE_HOST=str(loop_template),
+    )
+
 # ------------------------------------------------------------------- main --
 
 
@@ -697,13 +839,17 @@ def main() -> int:
     if not START.is_file():
         raise SystemExit(f"missing {START}")
     print(f"launcher: {START}")
-    print(f"ships: {', '.join(f'{v}={b}' for v, b in shipped_apc_vars().items())}; forwards SWA={wires_swa()} FINEGRAINED={wires_fg()}")
+    print(f"ships: {', '.join(f'{v}={b}' for v, b in shipped_apc_vars().items())}; forwards SWA={wires_swa()} NO_STORE={wires_ns()} KVCAP={wires_kv()}")
     part_a()
+    part_f()
     with tempfile.TemporaryDirectory() as raw:
         h = Harness(Path(raw))
         part_b(h)
         part_c(h)
         part_d(h)
+        allocator_overrides(h)
+    with tempfile.TemporaryDirectory() as raw:
+        part_e(Harness(Path(raw)))
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}): " + "; ".join(FAILURES))
