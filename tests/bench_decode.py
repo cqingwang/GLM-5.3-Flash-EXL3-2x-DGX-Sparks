@@ -18,7 +18,11 @@ import urllib.request
 from pathlib import Path
 
 BASE = "http://127.0.0.1:8888"
-MODEL = "GLM-5.3-Flash-EXL3"
+MODEL = (
+    os.environ.get("BENCH_MODEL")
+    or os.environ.get("SERVED_MODEL_NAME")
+    or "GLM-5.3-Flash-EXL3"
+)
 BENCH_PROMPT = (
     "Write a detailed step-by-step explanation of how a hash map works, "
     "including collision handling, resizing, and time complexity. Be thorough."

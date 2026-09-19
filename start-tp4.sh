@@ -57,6 +57,8 @@ fi
 # Caller exports (MTP_TOKENS=2 ./start.sh restart) must win over .env.
 _cli_mtp="${MTP_TOKENS-}"
 _cli_spec="${SPEC_METHOD-}"
+_cli_dflash_tokens="${DFLASH_TOKENS-}"
+_cli_dflash_draft_tp="${DFLASH_DRAFT_TP-}"
 _cli_eager="${ENFORCE_EAGER-}"
 _cli_fused="${EXL3_FUSED_MOE-}"
 _cli_row_tile="${EXL3_MOE_ROW_TILE-}"
@@ -83,6 +85,8 @@ _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
 _cli_spinwait_ms="${GLM53_SPINWAIT_MS-}"
 _cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"
 _cli_apc_swa="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
+_cli_sparse_mla_slice_set="${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS+1}"
+_cli_sparse_mla_slice="${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
@@ -92,6 +96,8 @@ source "$SCRIPT_DIR/.env.tp4"
 set +a
 [ -n "${_cli_mtp}" ] && MTP_TOKENS="$_cli_mtp"
 [ -n "${_cli_spec}" ] && SPEC_METHOD="$_cli_spec"
+[ -n "${_cli_dflash_tokens}" ] && DFLASH_TOKENS="$_cli_dflash_tokens"
+[ -n "${_cli_dflash_draft_tp}" ] && DFLASH_DRAFT_TP="$_cli_dflash_draft_tp"
 [ -n "${_cli_eager}" ] && ENFORCE_EAGER="$_cli_eager"
 [ -n "${_cli_fused}" ] && EXL3_FUSED_MOE="$_cli_fused"
 [ -n "${_cli_row_tile}" ] && EXL3_MOE_ROW_TILE="$_cli_row_tile"
@@ -113,6 +119,7 @@ set +a
 [ -n "${_cli_indexer_workspace_set}" ] && GLM53_INDEXER_WORKSPACE="$_cli_indexer_workspace"
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
 [ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"
+[ -n "${_cli_sparse_mla_slice_set}" ] && VLLM_SM120_SPARSE_MLA_SLICE_TOKENS="$_cli_sparse_mla_slice"
 
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"
@@ -122,6 +129,8 @@ MODEL_CACHE_NAME="${MODEL_CACHE_NAME:-models--${MODEL//\//--}}"
 MODEL_FALLBACK_CACHE_NAME="${MODEL_FALLBACK_CACHE_NAME:-models--${MODEL_FALLBACK//\//--}}"
 # Hub commit on the Mia-AiLab mirror (the 5ab363a8-byte-identical upload).
 MODEL_REVISION="${MODEL_REVISION:-25a44fdbf16862a46b7cc9921142c6c81350af2f}"
+# Official TP4 target. Use the wheel-less :exl3 tag only through an explicit
+# recovery profile after recording that the official baseline is unavailable.
 IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash-EXL3}"
 GHCR_USER="${GHCR_USER:-MiaAI-Lab}"
@@ -208,7 +217,7 @@ MTP_TOKENS="${MTP_TOKENS:-2}"
 SPEC_METHOD="${SPEC_METHOD:-dflash}"
 DFLASH_MODEL="${DFLASH_MODEL:-incoai/GLM-5.3-Flash-DFlash2}"
 DFLASH_CACHE_NAME="${DFLASH_CACHE_NAME:-models--${DFLASH_MODEL//\//--}}"
-DFLASH_TOKENS="${DFLASH_TOKENS:-7}"
+DFLASH_TOKENS="${DFLASH_TOKENS:-3}"
 # 2 = shard the ~2.3 GiB DFlash2 drafter across TP (C4 keep, 2026-08-30:
 # idle 8k 938 / 16k 972 / 100k 997; decode structured 65.1 / prose 27.1).
 # 1 = rank 0 only (no CX7 on every draft step). Empty = inherit target TP.
@@ -216,11 +225,12 @@ DFLASH_TOKENS="${DFLASH_TOKENS:-7}"
 # non-causal dense SWA. TRITON_ATTN was an SM120 mask-fix this image lacks.
 DFLASH_DRAFT_TP="${DFLASH_DRAFT_TP-4}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1000000}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.87}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.75}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 # 8192 chunk × long history oversubscribes GB10 persistent_topk smem (300k crash).
 # E2 one-shot 2026-09-01: 7168 keep (100k ~1148 / 300k ~1107); 2048/3548 similar or slower.
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-7168}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+SHIP_IMAGE_RING="${SHIP_IMAGE_RING:-1}"
 CHAT_TEMPLATE_HOST="${CHAT_TEMPLATE_HOST:-$SCRIPT_DIR/files/chat_template.jinja}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-/opt/glm53/chat_template.jinja}"
 VIDEO_PATCH_HOST="${VIDEO_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm_video_placeholders.py}"
@@ -232,6 +242,7 @@ PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_gr
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
+SPARSE_MLA_SLICE_PATCH_HOST="${SPARSE_MLA_SLICE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_sparse_mla_slice.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 # Direct-I/O safetensors on the published InstantTensor image. Unset follows
 # IMAGE (*instanttensor* → on). Explicit empty (LOAD_FORMAT=) is vLLM auto.
@@ -526,6 +537,19 @@ validate_numeric_config() {
     _glm53_validate_mixed_prefill || return
     _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL "${GLM53_APC_RETENTION_INTERVAL-}" || return
     _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL_SWA "${GLM53_APC_RETENTION_INTERVAL_SWA-}" || return
+    case "${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS:-0}" in
+        0) ;;
+        64)
+            [ "$TP" = "4" ] && [ "$NNODES" = "4" ] || {
+                echo "VLLM_SM120_SPARSE_MLA_SLICE_TOKENS=64 requires TP=4 and NNODES=4" >&2
+                return 2
+            }
+            ;;
+        *)
+            echo "VLLM_SM120_SPARSE_MLA_SLICE_TOKENS must be 0 or 64 (got: ${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS})" >&2
+            return 2
+            ;;
+    esac
     if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ] && [ "$SPEC_METHOD" != "dflash" ]; then
         echo "GLM53_APC_RETENTION_INTERVAL_SWA requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
@@ -863,6 +887,7 @@ preflight() {
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
+    [ -f "$SPARSE_MLA_SLICE_PATCH_HOST" ] || die "$SPARSE_MLA_SLICE_PATCH_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
     [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
     [ -f "$SCRIPT_DIR/ablit/LAYER_MAP.json" ] || die "$SCRIPT_DIR/ablit/LAYER_MAP.json missing"
@@ -1019,6 +1044,23 @@ ship_image_to_worker() {
     docker save "$IMAGE" | worker_ssh_n "$r" docker load
 }
 
+ship_image_ring() {
+    local platform r1 r2 r3 loader
+    platform="$(image_platform)"
+    r1="$(_tp4_ssh_target 1)"
+    r2="$(_tp4_ssh_target 2)"
+    r3="$(_tp4_ssh_target 3)"
+    loader="${IMAGE_RING_LOADER:-/opt/spark/glm53_flash_exl3/scripts/ring_docker_load.sh}"
+    log "shipping ${IMAGE} (${platform}) over management ring ${r1} -> ${r2} -> ${r3} ..."
+    if docker save --platform "$platform" "$IMAGE" | ssh -T -o BatchMode=yes -o ConnectTimeout=15 "$r1" \
+        "$loader '$r2' '$r3' '$IMAGE'"; then
+        return 0
+    fi
+    warn "docker save --platform ${platform} ring transfer failed — retrying without --platform"
+    docker save "$IMAGE" | ssh -T -o BatchMode=yes -o ConnectTimeout=15 "$r1" \
+        "$loader '$r2' '$r3' '$IMAGE'"
+}
+
 ensure_image() {
     mkdir -p "$LOGDIR"
     local head_ok=0 worker_ok=0 head_key="" worker_key=""
@@ -1087,7 +1129,14 @@ ensure_image() {
     if [ "${SKIP_SHIP:-0}" = "1" ]; then
         [ "$worker_ok" = "1" ] || warn "SKIP_SHIP=1 — not copying ${IMAGE} to workers"
     elif [ "$worker_ok" = "0" ]; then
-        for r in 1 2 3; do
+        if [ "${SHIP_IMAGE_RING:-0}" = "1" ]; then
+            ship_image_ring
+            for r in 1 2 3; do
+                worker_key="$(worker_image_key "$r" || true)"
+                images_match "$head_key" "$worker_key" || die "rank ${r} image differs after ring ship"
+            done
+        else
+            for r in 1 2 3; do
             local wok=0
             worker_key="$(worker_image_key "$r" || true)"
             if images_match "$head_key" "$worker_key"; then
@@ -1117,7 +1166,8 @@ ensure_image() {
                     die "rank ${r} still missing ${IMAGE} after ship"
                 fi
             fi
-        done
+            done
+        fi
     fi
     if [ "${SKIP_OVERLAY_VERIFY:-0}" != "1" ]; then
         log "GPU EXL3 self-check on ${IMAGE} (log: $LOGDIR/overlay-verify.log) ..."
@@ -1442,6 +1492,9 @@ fi
 if [ -f /opt/glm53/patch_indexer_workspace.py ]; then
     python3 /opt/glm53/patch_indexer_workspace.py
 fi
+if [ "${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS:-0}" = "64" ]; then
+    python3 /opt/glm53/patch_sparse_mla_slice.py
+fi
 if [ -f /opt/glm53/patch_ablit.py ]; then
     python3 /opt/glm53/patch_ablit.py
 fi
@@ -1543,6 +1596,9 @@ fi
 if [ -f /opt/glm53/patch_indexer_workspace.py ]; then
     python3 /opt/glm53/patch_indexer_workspace.py
 fi
+if [ "${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS:-0}" = "64" ]; then
+    python3 /opt/glm53/patch_sparse_mla_slice.py
+fi
 if [ -f /opt/glm53/patch_ablit.py ]; then
     python3 /opt/glm53/patch_ablit.py
 fi
@@ -1573,6 +1629,7 @@ _tp4_scp_runtime() {
     scp -q -o BatchMode=yes "$XGRAMMAR_PATCH_HOST" "${ssh_t}:/tmp/patch_xgrammar_termination.py"
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${ssh_t}:/tmp/patch_kpool_tail_slotmap.py"
     scp -q -o BatchMode=yes "$SPINWAIT_PATCH_HOST" "${ssh_t}:/tmp/patch_spinwait.py"
+    scp -q -o BatchMode=yes "$SPARSE_MLA_SLICE_PATCH_HOST" "${ssh_t}:/tmp/patch_sparse_mla_slice.py"
     worker_ssh_n "$r" "rm -rf /tmp/glm53-ablit"
     scp -q -r -o BatchMode=yes "$SCRIPT_DIR/ablit" "${ssh_t}:/tmp/glm53-ablit"
     scp -q -o BatchMode=yes "$SCRIPT_DIR/overlay/ablit_runtime.py" "${ssh_t}:/tmp/glm53-ablit_runtime.py"
@@ -1706,7 +1763,8 @@ TP4_SKIP_OLD_SCP
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL MODEL_DIR EXTRA_ARGS \
-             ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP; do
+             ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
+             VLLM_SM120_SPARSE_MLA_SLICE_TOKENS; do
         serve_env+=" -e $v='${!v:-}'"
     done
     # VLLM_API_KEY is read by the head (rank 0) API server for bearer auth; the
@@ -1762,6 +1820,7 @@ TP4_SKIP_OLD_SCP
             -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
             -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
             -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
+            -v '/tmp/patch_sparse_mla_slice.py:/opt/glm53/patch_sparse_mla_slice.py:ro' \
             -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
             -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
             -v '/tmp/patch_ablit.py:/opt/glm53/patch_ablit.py:ro' \
@@ -1804,6 +1863,7 @@ TP4_SKIP_OLD_SCP
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
+        -v "$SPARSE_MLA_SLICE_PATCH_HOST:/opt/glm53/patch_sparse_mla_slice.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
         -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
         -v "$SCRIPT_DIR/overlay/patch_ablit.py:/opt/glm53/patch_ablit.py:ro" \
@@ -1841,6 +1901,7 @@ TP4_SKIP_OLD_SCP
         -e EXL3_FAT_SORTED="$EXL3_FAT_SORTED" \
         -e EXL3_FAT_BATCHED="$EXL3_FAT_BATCHED" \
         -e EXL3_FAT_KERNEL="$EXL3_FAT_KERNEL" \
+        -e VLLM_SM120_SPARSE_MLA_SLICE_TOKENS="$VLLM_SM120_SPARSE_MLA_SLICE_TOKENS" \
         -e ABLIT="$ABLIT" \
         -e ABLIT_METHOD="$ABLIT_METHOD" \
         -e ABLIT_DIRECTION="$ABLIT_DIRECTION" \

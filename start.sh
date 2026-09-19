@@ -89,6 +89,16 @@ ABLIT=0
 for _kv in ${_caller_overrides[@]+"${_caller_overrides[@]}"}; do export "$_kv"; done
 unset _k _kv _flags _caller_overrides
 
+# 基础模板现在以 TP4 为安全默认；旧入口遇到 TP4 时必须转交四节点入口，
+# 不能让只有一个 worker 的 TP2 编排错误地承载四卡 world size。
+if [ "${TP:-}" = "4" ] || [ "${NNODES:-}" = "4" ]; then
+    if [ "${TP:-}" = "4" ] && [ "${NNODES:-}" = "4" ]; then
+        exec "$SCRIPT_DIR/start-tp4.sh" "$@"
+    fi
+    echo "ERROR: TP and NNODES must both be 4 for the TP4 official profile; got TP=${TP:-unset} NNODES=${NNODES:-unset}" >&2
+    exit 2
+fi
+
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"
 # When set, serve this already materialized local checkpoint instead of the

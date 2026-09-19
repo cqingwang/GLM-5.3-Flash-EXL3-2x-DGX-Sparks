@@ -619,6 +619,12 @@ before selecting a policy or a cache budget for another kit.
 
 ## Existing installs: pull the InstantTensor image
 
+> 当前本仓库的四节点 TP4 运行 profile 默认仍使用 wheel-less `:exl3`：本地
+> `Mia-AiLab/GLM-5.3-Flash-exl3-4bpw-ablit` 权重在 `:exl3-instanttensor`
+> 镜像的 `instanttensor.safe_open` 元数据阶段会报 `NoneType` 解包异常，尚未通过
+> 加载和 `/health` 验收。只有在该 checkpoint/loader 组合单独验证通过后，才应
+> 设置 `IMAGE=:exl3-instanttensor`、`LOAD_FORMAT=instanttensor` 并把 `SKIP_PULL=0`。
+
 `main` now defaults to
 `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor`.
 **`git pull` does not switch the running containers or a leftover `.env`.**
